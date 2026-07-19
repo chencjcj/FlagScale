@@ -38,9 +38,9 @@ def save_checkpoint(queue, args):
     try:
         import transformers
         major, minor, _ = map(int, transformers.__version__.split('.'))
-        assert major >= 4 and minor >= 36
+        assert major>=5 and minor>=4, "transformers version >= 5.4.0 is required"
     except:
-        raise ImportError("transformers version >= 4.36.0 ")
+        raise ImportError("transformers version >= 5.4.0 is required, please install it via `pip install transformers>=5.4.0`")
 
     # Search in directory above this
     root_path = os.path.abspath(
