@@ -139,12 +139,12 @@ model:
 data:
   reset_position_ids: true
   reset_attention_mask: true
-  data_path: /nfs/lizhiyu/data/pile_wikipedia_demo
+  data_path: /mnt/nfs/chenjun/FlagOS/data/pile_wikipedia_demo
   split: 1
   no_mmap_bin_files: true
   tokenizer:
     tokenizer_type: HuggingFaceTokenizer
     # tokenizer_path: /share/project/lizhiyu/data/GLM-5/
-    tokenizer_model: /nfs/lizhiyu/data/zai-org/GLM-5/
-    vocab_size: 154880
+    tokenizer_model: /model/GLM-5.2-FP8/
+    vocab_size: 154880  # NOTE: verify against /model/GLM-5.2-FP8/config.json vocab_size
     make_vocab_size_divisible_by: 64
