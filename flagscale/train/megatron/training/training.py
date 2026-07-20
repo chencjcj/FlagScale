@@ -121,6 +121,7 @@ try:
     from modelopt.torch.distill.plugins.megatron import (
         get_tensor_shapes_adjust_fn_for_distillation,
     )
+    from megatron.post_training.checkpointing import has_modelopt_state
 
     has_nvidia_modelopt = True
 except ImportError:
