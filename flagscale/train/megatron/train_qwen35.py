@@ -89,6 +89,38 @@ from flagscale.models.megatron.qwen3_vl.layer_specs import get_qwen3vl_vision_mo
 from megatron.plugin.platform import get_platform
 cur_platform = get_platform()
 
+######### FlagScale Begin #########
+# Route the Gated DeltaNet ops through native-torch implementations, or fla's
+# triton kernels with FLAGSCALE_MUSA_GDN_IMPL=fla. Also let the MUSA TE build
+# load the empty _extra_state tensors written by the Qwen3.5 converter, and run
+# head_dim=256 attention via SDPA (MUSA flash_attn caps head_dim at 192).
+if getattr(cur_platform, "_name", None) == "musa":
+    from patches.musa_attention import apply_musa_large_head_dim_attn_patch
+    from patches.musa_gdn import (
+        apply_musa_gdn_patch,
+        apply_musa_te_extra_state_patch,
+        apply_musa_te_grouped_linear_patch,
+    )
+    from patches.musa_te_layernorm import apply_musa_te_rmsnorm_zero_centered_patch
+
+    # MUSA RMSNorm ignores zero_centered_gamma (Qwen3.5 uses it everywhere).
+    apply_musa_te_rmsnorm_zero_centered_patch()
+    apply_musa_gdn_patch()
+    apply_musa_te_extra_state_patch()
+    # MoE (Qwen3.6): MUSA TE GroupedLinear imports musa_patch.mem_utils, and the
+    # alltoall dispatcher's uneven reduce-scatter (expert TP > 1) fails on flagcx.
+    from patches.musa_collectives import apply_musa_uneven_reduce_scatter_patch
+
+    apply_musa_te_grouped_linear_patch()
+    apply_musa_uneven_reduce_scatter_patch()
+    apply_musa_large_head_dim_attn_patch()
+    # Megatron's jit_fuser is a no-op off CUDA; opt in to fused triton SwiGLU.
+    if os.environ.get("FLAGSCALE_MUSA_TRITON_SWIGLU", "0") == "1":
+        from patches.musa_swiglu import apply_musa_triton_swiglu_patch
+
+        apply_musa_triton_swiglu_patch()
+######### FlagScale End #########
+
 from tools.datasets.qwenvl.data.dataset_helpers import TaskEncoder, print_error_handler
 
 IGNORE_IDX = -100
@@ -463,6 +495,9 @@ def write_online_eval_to_tensorboard(data, iteration, writer):
 # Text-only (GPT-style) data loading — used when enable_vision=False
 ###############################################################################
 
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.training.training import update_seqlen_stats_from_cu_seqlens
+
 from flagscale.train.megatron.train_gpt import (
     get_batch as get_batch_gpt,
     train_valid_test_datasets_provider as train_valid_test_datasets_provider_gpt,
@@ -472,9 +507,40 @@ from flagscale.train.megatron.train_gpt import (
 
 def get_batch_text(data_iterator, vp_stage: Optional[int] = None):
     """Generate a batch for text-only training (GPT-style), with mRoPE position_ids."""
-    tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = get_batch_gpt(
-        data_iterator, vp_stage
-    )
+    # train_gpt.get_batch returns the raw batch fields (in BATCH_KEYS order) and
+    # leaves PackedSeqParams construction to its forward_step; mirror that here.
+    (
+        attention_mask,
+        cu_seqlens,
+        cu_seqlens_padded,
+        hybrid_cp_group,
+        labels,
+        local_cp_size,
+        loss_mask,
+        max_seqlen,
+        position_ids,
+        tokens,
+    ) = get_batch_gpt(data_iterator, vp_stage)
+
+    packed_seq_params = None
+    if cu_seqlens is not None:
+        # The dataloader keeps a batch dim (1, n); PackedSeqParams expects 1-D.
+        cu_seqlens = cu_seqlens[0]
+        if cu_seqlens_padded is not None:
+            cu_seqlens_padded = cu_seqlens_padded[0]
+        update_seqlen_stats_from_cu_seqlens(cu_seqlens)
+        cu_seqlens_for_params = cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens_for_params,
+            cu_seqlens_kv=cu_seqlens_for_params,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            max_seqlen_q=int(max_seqlen.item()),
+            max_seqlen_kv=int(max_seqlen.item()),
+            local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
+            cp_group=hybrid_cp_group,
+        )
 
     # Expand position_ids from [B, S] to [3, B, S] for mRoPE (text-only: all 3 dims identical)
     if position_ids is not None:

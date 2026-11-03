@@ -1,0 +1,53 @@
+# Qwen3.6-35B-A3B image-text training on MUSA (MTT S5000), 4 nodes x 8 GPUs,
+# TP1 PP2 EP16 following the NVIDIA Qwen3.5-35B-A3B config.
+#
+# Set before launching:
+#   QWEN36_HF_PATH        HF checkpoint dir (tokenizer), e.g. /workspace/Qwen3.6-35B-A3B
+#   QWEN36_MM_LOAD        Megatron TP1 PP2 EP16 checkpoint (tools/checkpoint/qwen35
+#                         hf2meg with train/35b_a3b_musa.yaml)
+#   QWEN36_MM_DATA_PATH   energon WebDataset (see examples/qwen35/README.md)
+#   QWEN36_MM_VISION_ROOT image root for that dataset
+#   QWEN36_OUTPUT_DIR / QWEN36_HOSTFILE (optional)
+# Needs fla + fla-core 0.6.0 importable (QWEN36_FLA_PATH, default /workspace/fla_pkg)
+# and megatron-energon==6.0.1 webdataset==1.0.2 multi-storage-client==0.30.0.
+# Before a new config, warm the per-node triton cache with
+# examples/qwen35/warmup_fla_musa.py 1 2 --model qwen36-35b-a3b --seq-length 2048.
+#
+# python run.py --config-path ./examples/qwen36/conf --config-name train_musa action=run
+defaults:
+  - _self_
+  - train: 35b_a3b_musa
+
+experiment:
+  exp_name: qwen36_35b_a3b_musa
+  exp_dir: ${oc.env:QWEN36_OUTPUT_DIR,./outputs/qwen36_35b_a3b_musa}
+  task:
+    type: train
+    backend: megatron
+    entrypoint: ./flagscale/train/megatron/train_qwen35.py
+  runner:
+    nnodes: 4
+    nproc_per_node: 8
+    hostfile: ${oc.env:QWEN36_HOSTFILE,./examples/qwen35/conf/hostfile.txt}
+    per_node_task: false
+    no_shared_fs: false
+    rdzv_backend: static
+    ssh_port: 2222
+  envs:
+    CUDA_VISIBLE_DEVICES: 0,1,2,3,4,5,6,7
+    CUDA_DEVICE_MAX_CONNECTIONS: 1
+    MCCL_TOPO_ENHANCE: "0"
+    HYDRA_FULL_ERROR: "1"
+    OMP_NUM_THREADS: 4
+    FLAGSCALE_MUSA_GDN_IMPL: fla
+    FLAGSCALE_MUSA_TRITON_SWIGLU: "1"
+    PYTORCH_MUSA_ALLOC_CONF: expandable_segments:True
+    # Inline env overrides the run script's PYTHONPATH export, so keep the
+    # FlagScale paths here as well.
+    PYTHONPATH: ${oc.env:QWEN36_FLA_PATH,/workspace/fla_pkg}:/workspace/FlagScale:/workspace/FlagScale/flagscale/train
+
+action: run
+
+hydra:
+  run:
+    dir: ${experiment.exp_dir}/hydra

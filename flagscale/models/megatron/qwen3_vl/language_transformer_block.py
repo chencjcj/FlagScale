@@ -202,6 +202,16 @@ class LanguageTransformerBlock(TransformerBlock):
                     hidden_states, context = custom(layer_idx, layer_idx + 1)(
                         hidden_states, attention_mask, context, context_mask, rotary_pos_emb
                     )
+
+                # Same per-layer deepstack injection as the uniform path above.
+                if visual_pos_masks is not None and deepstack_visual_embeds is not None:
+                    assert len(self.layers) >= len(deepstack_visual_embeds), f"First pipeline stage should have at least {len(self.layers)} layers for deepstack."
+                    if layer_idx < len(deepstack_visual_embeds):
+                        hidden_states = self._deepstack_process(
+                            hidden_states,
+                            visual_pos_masks,
+                            deepstack_visual_embeds[layer_idx],
+                        )
         else:
             raise ValueError("Invalid activation recompute method.")
 
@@ -316,12 +326,12 @@ class LanguageTransformerBlock(TransformerBlock):
             # Forward pass.
             if self.config.recompute_granularity == "full" and self.training:
                 if visual_pos_masks is not None or deepstack_visual_embeds is not None:
-                    assert (
+                    assert self.config.recompute_method == "block" or (
                         self.config.recompute_method == "uniform"
                         and self.config.recompute_num_layers == 1
                     ), (
-                        f"Only uniform recompute with recompute_num_layers=1 is supported "
-                        f"for full recompute when deepstack is enabled."
+                        f"Full recompute with deepstack requires recompute_method=block, "
+                        f"or uniform with recompute_num_layers=1."
                     )
                 hidden_states = self._checkpointed_forward(
                     hidden_states=hidden_states,

@@ -1,0 +1,169 @@
+# Qwen3.6-35B-A3B image-text training on MUSA (MTT S5000), 4 nodes x 8 GPUs.
+# Follows the NVIDIA Qwen3.5-35B-A3B multimodal config (TP1 PP2 EP16, seq 2048,
+# MTP 1, ViT trained); differences:
+#   * MUSA backend: vendor TE, mccl, unfused attention (head_dim 256 goes
+#     through the SDPA patch), no rope / MoE permute fusion (CUDA-only kernels).
+#   * Fixed 2048 padding (NVIDIA: enable_variable_seq_lengths). Variable lengths
+#     change the GDN kernel shapes per batch; not yet tried on MUSA.
+#   * Short bring-up schedule (train_iters 10); NVIDIA: 5000.
+#   * distributed_backend mccl instead of flagcx (see note at the key).
+#   * micro_batch_size 2 and no LM recompute (NVIDIA: 1, full recompute).
+# Measured 2026-11-02, steps 4-10, gbs 256: 25 TFLOP/s/GPU, ~14.5 s/step, peak
+# ~51 GB on stage 0. With mbs 1 + full recompute: 17.3, 20.8 s. A 17/23 layer
+# split (stage 0 carries the ViT) balanced stage compute but did not change
+# step time; the remaining ~2 s wait is the 1F1B bubble for 8 microbatches.
+# TP1 means expert TP is 1 too, so the MoE dispatcher has no uneven TP
+# reduce-scatter. EP16 spans the two nodes of each pipeline stage.
+system:
+  vision_ration: 0.1
+  num_workers: 4
+  calculate_per_token_loss: true
+  tensor_model_parallel_size: 1
+  pipeline_model_parallel_size: 2
+  context_parallel_size: 1
+  expert_model_parallel_size: 16
+  use_flash_attn: false
+  use_distributed_optimizer: true
+  sequence_parallel: true
+  tp_comm_overlap: false
+  overlap_grad_reduce: false
+  overlap_param_gather: false
+  use_mcore_models: true
+  transformer_impl: transformer_engine
+  use_te: true
+  precision:
+    bf16: true
+    attention_softmax_in_fp32: true
+    accumulate_allreduce_grads_in_fp32: true
+  logging:
+    timing_log_level: 2
+    timing_log_option: minmax
+    logging_level: 20
+    log_interval: 1
+    log_throughput: true
+    log_params_norm: true
+    log_num_zeros_in_grad: true
+  checkpoint:
+    save_interval: 10000
+    ckpt_format: torch
+    load: ${oc.env:QWEN36_MM_LOAD}
+    save: ${experiment.exp_dir}/checkpoints
+    no_save_at_end: true
+
+model:
+  te_fl_prefer: vendor
+  enable_flag_gems: false
+  # mccl, not flagcx: with flagcx, stage 0 stalls in the cross-node EP16 MoE
+  # dispatch (GPUs idle, ranks spinning in stream.synchronize) and never
+  # finishes the first microbatch; isolated all-to-all is fine with both.
+  distributed_backend: mccl
+  attention_backend: unfused
+  # Qwen3.6-35B-A3B architecture (same shapes as Qwen3.5-35B-A3B)
+  kv_channels: 256
+  qk_layernorm: true
+  disable_bias_linear: true
+  num_layers: 40
+  hidden_size: 2048
+  num_attention_heads: 16
+  num_query_groups: 2
+  seq_length: 2048
+  max_padding_length: 2048
+  enable_variable_seq_lengths: false
+  max_position_embeddings: 262144
+  swiglu: true
+  normalization: RMSNorm
+  norm_epsilon: 1e-6
+  init_method_std: 0.02
+  attention_dropout: 0.0
+  hidden_dropout: 0.0
+  clip_grad: 1.0
+  train_iters: 10
+  eval_iters: 0
+  eval_interval: 10000
+  # mbs 2 doubles every GEMM (hidden 2048, expert ffn 512 are small): 17.5 ->
+  # 14.5 s/step vs mbs 1 without recompute. Warm the triton cache for B=2.
+  micro_batch_size: 2
+  global_batch_size: 256
+  allow_missing_vision_projection_checkpoint: false
+  apply_layernorm_1p: false
+  group_query_attention: true
+  no_masked_softmax_fusion: true
+  untie_embeddings_and_output_weights: true
+
+  position_embedding_type: mrope
+  rotary_percent: 0.25
+  rotary_base: 10000000
+  rotary_seq_len_interpolation_factor: 1
+  # mRoPE fusion kernel is CUDA-only.
+  no_rope_fusion: true
+  mrope_section: [11, 11, 10]
+  eod_mask_loss: false
+
+  # Vision model
+  patch_size: 16
+  freeze_LM: false
+  freeze_ViT: false
+  disable_vision_class_token: true
+
+  mtp_num_layers: 1
+
+  # No LM recompute: peak is ~51 GB of 80 at mbs 2, and full recompute repeats
+  # every forward (including the cross-node EP all-to-alls): 17.5 -> 20.8 s/step
+  # at mbs 1. The ViT keeps its own activation recompute.
+  vision_recompute_activations: true
+
+  seed: 42
+
+  # Gated DeltaNet
+  experimental_attention_variant: gated_delta_net
+  linear_attention_freq: 4
+  linear_conv_kernel_dim: 4
+  linear_key_head_dim: 128
+  linear_value_head_dim: 128
+  linear_num_key_heads: 16
+  linear_num_value_heads: 32
+  layernorm_zero_centered_gamma: true
+  attention_output_gate: true
+
+  # Vision encoder
+  vision_num_layers: 27
+  vision_hidden_size: 1152
+  vision_ffn_hidden_size: 4304
+  vision_num_attention_heads: 16
+
+  # MoE
+  num_experts: 256
+  moe_router_topk: 8
+  moe_ffn_hidden_size: 512
+  moe_shared_expert_gate: true
+  moe_shared_expert_intermediate_size: 512
+  moe_router_dtype: fp32
+  moe_router_load_balancing_type: global_aux_loss
+  moe_router_pre_softmax: false
+  moe_grouped_gemm: true
+  moe_token_dispatcher_type: alltoall
+  moe_permute_fusion: false
+  moe_aux_loss_coeff: 1.0e-3
+
+  optimizer:
+    weight_decay: 0.1
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    lr_scheduler:
+      lr: 5.0e-6
+      min_lr: 5.0e-7
+      lr_warmup_fraction: .03
+      lr_decay_style: cosine
+
+data:
+  no_use_system_prompt: true
+  vocab_size: 248320
+  data_path: ${oc.env:QWEN36_MM_DATA_PATH}
+  vision_root: ${oc.env:QWEN36_MM_VISION_ROOT}
+  dataloader_type: external
+  split: 100,0,0
+  tokenizer:
+    tokenizer_type: Qwen2VLTokenizer
+    tokenizer_path: ${oc.env:QWEN36_HF_PATH}
+    extra_vocab_size: 0
+    make_vocab_size_divisible_by: 64

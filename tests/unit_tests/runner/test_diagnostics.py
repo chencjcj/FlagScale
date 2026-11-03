@@ -67,7 +67,8 @@ def test_command_body_preserves_exit_actions_and_clears_matching_active_run(tmp_
     assert "run-123" in command
     assert "rm -f" in command
     assert "diagnostics.active_run_id" in command
-    assert command.endswith("sync; exit \\$rc")
+    assert command.endswith("; exit \\$rc")
+    assert "sync" not in command
 
 
 def test_cleanup_only_removes_the_matching_run(tmp_path):

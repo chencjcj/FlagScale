@@ -107,9 +107,11 @@ def diagnostic_command_body(
     ]
     if node_rank == 0 and active_run_id_path and active_run_id:
         actions.append(active_run_id_cleanup_action(active_run_id_path, active_run_id))
+    # No trailing global `sync`: on large NFS mounts it can hang for hours in
+    # uninterruptible state and keep the log files open (stale .nfs* files).
     if not actions:
-        return "$cmd; sync"
-    return f"$cmd; rc=\\$?; {'; '.join(dict.fromkeys(actions))}; sync; exit \\$rc"
+        return "$cmd"
+    return f"$cmd; rc=\\$?; {'; '.join(dict.fromkeys(actions))}; exit \\$rc"
 
 
 def stop_process_shell_lines(

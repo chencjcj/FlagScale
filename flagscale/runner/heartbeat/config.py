@@ -106,9 +106,10 @@ class HeartbeatLaunchConfig:
     def training_command_body(self, node_rank: int) -> str:
         """Run training and notify the node-zero heartbeat monitor on exit."""
         exit_actions = self.command_exit_actions(node_rank)
+        # No trailing global `sync` (can hang on NFS); see diagnostic_command_body.
         if not exit_actions:
-            return "$cmd; sync"
-        return "$cmd; rc=\\$?; " + "; ".join(exit_actions) + "; sync; exit \\$rc"
+            return "$cmd"
+        return "$cmd; rc=\\$?; " + "; ".join(exit_actions) + "; exit \\$rc"
 
     def command_exit_actions(self, node_rank: int) -> list[str]:
         """Return cleanup actions for a shared diagnostic command wrapper."""

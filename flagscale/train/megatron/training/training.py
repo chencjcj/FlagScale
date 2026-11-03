@@ -1710,7 +1710,7 @@ def pretrain(
 
         print_datetime('after training is done')
 
-        if not args.auto_tune:
+        if not args.auto_tune and not args.no_save_at_end:  # FlagScale Modify
             if not cfg_container.validation.skip_train and cfg_container.checkpoint.save and iteration != 0 and iteration % cfg_container.checkpoint.save_interval != 0:
                 save_checkpoint_and_time(
                     iteration,
@@ -3882,7 +3882,8 @@ def train(
 
             ########## FlagScale Begin ##########
             kernel_details_path, kernel_summary_path, operator_list_path = export_kernel_reports(
-                p.events(), profile_dir, rank, f"{profile_dir}/rank-{torch.distributed.get_rank()}.json.gz"
+                # FlagScale Modify: `rank` is only bound when log_straggler is set.
+                p.events(), profile_dir, torch.distributed.get_rank(), f"{profile_dir}/rank-{torch.distributed.get_rank()}.json.gz"
             )
             print(f"[CUDA] kernel details report is saved to: {kernel_details_path}")
             print(f"[CUDA] kernel summary report is saved to: {kernel_summary_path}")

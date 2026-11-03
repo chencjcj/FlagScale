@@ -293,7 +293,7 @@ def test_generate_run_script_foreground(
             content = f.read()
             assert "nohup" not in content
             assert "set -o pipefail" in content
-            assert 'bash -c "$cmd; sync"' in content
+            assert 'bash -c "$cmd"' in content
             assert "tee -a" in content
 
 

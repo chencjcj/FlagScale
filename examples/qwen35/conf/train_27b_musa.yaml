@@ -1,0 +1,105 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Qwen3.5-27B image-text training on MUSA (Moore Threads), 4 nodes x 8 GPUs.
+# Adapted from the NVIDIA train/27b.yaml following examples/glm5/conf/train/musa.yaml.
+# Parallelism from train/27b.yaml: TP=4, PP=2  ->  DP = 32 / (4*2) = 4.
+#
+# MUSA gaps are patched at runtime by train_qwen35.py (flagscale/train/megatron/
+# patches/): GDN fla ops -> native torch (triton has no MUSA driver), RMSNorm
+# zero_centered_gamma, ViT LayerNorm, head_dim=256 attention -> SDPA, and empty
+# TE _extra_state loading. Every node additionally needs (pinned, --no-deps):
+#   megatron-energon==6.0.1 webdataset==1.0.2 multi-storage-client==0.30.0
+#
+# Set these env vars before launching (same as train_27b.yaml):
+#   QWEN35_HF_PATH QWEN35_LOAD QWEN35_DATA_PATH QWEN35_VISION_ROOT
+#   QWEN35_OUTPUT_DIR QWEN35_HOSTFILE
+defaults:
+  - train: 27b
+  - _self_
+
+experiment:
+  exp_name: qwen35_27b_musa
+  exp_dir: ${oc.env:QWEN35_OUTPUT_DIR,./outputs/qwen35_27b_musa}
+  task:
+    type: train
+    backend: megatron
+    entrypoint: ./flagscale/train/megatron/train_qwen35.py
+  runner:
+    nnodes: 4
+    nproc_per_node: 8
+    hostfile: ${oc.env:QWEN35_HOSTFILE,./examples/qwen35/conf/hostfile.txt}
+    # MUSA multi-node (mirrors glm5): shared NFS present, static rendezvous.
+    per_node_task: false
+    no_shared_fs: false
+    rdzv_backend: static
+    # sshd on these nodes listens on 62216 (/etc/ssh/ssh_config); the runner
+    # passes -p explicitly, so it must match.
+    ssh_port: 62216
+  envs:
+    CUDA_VISIBLE_DEVICES: 0,1,2,3,4,5,6,7
+    CUDA_DEVICE_MAX_CONNECTIONS: 1
+    MCCL_TOPO_ENHANCE: "0"
+    HYDRA_FULL_ERROR: "1"
+    OMP_NUM_THREADS: 4
+
+action: run
+
+train:
+  system:
+    # MUSA has no fused flash-attention kernel; use the unfused SDPA path.
+    use_flash_attn: false
+    # Perf-only overlaps off on MUSA TE backend (see glm5 musa.yaml note).
+    tp_comm_overlap: false
+    overlap_grad_reduce: false
+    overlap_param_gather: false
+    precision:
+      bf16: true
+      attention_softmax_in_fp32: true
+      accumulate_allreduce_grads_in_fp32: true
+    logging:
+      log_interval: 1
+      # Print "throughput per GPU (TFLOP/s/GPU)" in each iteration line.
+      log_throughput: true
+      # Per-iteration timer breakdown: 1 = grad sync / optimizer,
+      # 2 = also forward-compute / backward-compute per microbatch.
+      timing_log_level: 2
+      timing_log_option: minmax
+      # Timers are printed via logger.info, which is hidden unless the Python
+      # logging level is INFO (20).
+      logging_level: 20
+    checkpoint:
+      load: ${oc.env:QWEN35_LOAD}
+      save: ${experiment.exp_dir}/checkpoints
+  model:
+    # MUSA / FlagOS backend selection (from glm5 musa.yaml).
+    te_fl_prefer: vendor
+    enable_flag_gems: false
+    distributed_backend: flagcx
+    # MUSA has no fused flash-attention kernel; use the unfused SDPA path.
+    attention_backend: unfused
+    # mRoPE fusion kernel is CUDA-only; disable on MUSA.
+    no_rope_fusion: true
+    # Keep full uniform recompute: with TP4 PP1 mbs2 seq8192 each GDN layer
+    # kept un-recomputed costs ~3 GB (torch GDN fallback); even 4 layers
+    # (recompute_method=block, recompute_num_layers=60) OOMs by iteration 2.
+  data:
+    data_path: ${oc.env:QWEN35_DATA_PATH}
+    vision_root: ${oc.env:QWEN35_VISION_ROOT}
+    tokenizer:
+      tokenizer_path: ${oc.env:QWEN35_HF_PATH}
+
+hydra:
+  run:
+    dir: ${experiment.exp_dir}/hydra

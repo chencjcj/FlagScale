@@ -73,6 +73,20 @@ from megatron.plugin.platform import get_platform
 
 cur_platform = get_platform()
 
+######### FlagScale Begin #########
+# MUSA ships a non-functional LayerNorm in its Transformer-Engine backend
+# (the nvte kernel calls are stubbed out), which crashes the GLM5/DeepSeek-V3.2
+# DSA indexer k_norm. Route TE's ops LayerNorm through native torch on MUSA.
+if getattr(cur_platform, "_name", None) == "musa":
+    from patches.musa_te_layernorm import (
+        apply_musa_hadamard_patch,
+        apply_musa_te_layernorm_patch,
+    )
+
+    apply_musa_te_layernorm_patch()
+    apply_musa_hadamard_patch()
+######### FlagScale End #########
+
 try:
     from megatron.post_training.arguments import add_modelopt_args
     from megatron.post_training.loss_func import loss_func as loss_func_modelopt

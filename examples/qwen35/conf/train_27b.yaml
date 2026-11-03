@@ -1,0 +1,60 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Qwen3.5-27B image-text training on 4 nodes x 8 GPUs (32 GPUs).
+# Parallelism from train/27b.yaml: TP=4, PP=2  ->  DP = 32 / (4*2) = 4.
+# Set these env vars before launching (or edit the defaults below):
+#   QWEN35_HF_PATH      HF model/tokenizer dir (shared across nodes)
+#   QWEN35_LOAD         Megatron TP4/PP2 checkpoint dir to load from
+#   QWEN35_DATA_PATH    Energon data dir (the one containing .nv-meta)
+#   QWEN35_VISION_ROOT  image root; images read as VISION_ROOT/<relative path>
+#   QWEN35_OUTPUT_DIR   experiment output dir (shared across nodes)
+#   QWEN35_HOSTFILE     path to the 4-node hostfile
+defaults:
+  - train: 27b
+  - _self_
+
+experiment:
+  exp_name: qwen35_27b
+  exp_dir: ${oc.env:QWEN35_OUTPUT_DIR,./outputs/qwen35_27b}
+  task:
+    type: train
+    backend: megatron
+    entrypoint: ./flagscale/train/megatron/train_qwen35.py
+  runner:
+    nnodes: 4
+    nproc_per_node: 8
+    hostfile: ${oc.env:QWEN35_HOSTFILE,./examples/qwen35/conf/hostfile.txt}
+  envs:
+    CUDA_VISIBLE_DEVICES: 0,1,2,3,4,5,6,7
+    CUDA_DEVICE_MAX_CONNECTIONS: 1
+    NVTE_APPLY_QK_LAYER_SCALING: 0
+    NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+
+action: run
+
+train:
+  system:
+    checkpoint:
+      load: ${oc.env:QWEN35_LOAD}
+      save: ${experiment.exp_dir}/checkpoints
+  data:
+    data_path: ${oc.env:QWEN35_DATA_PATH}
+    vision_root: ${oc.env:QWEN35_VISION_ROOT}
+    tokenizer:
+      tokenizer_path: ${oc.env:QWEN35_HF_PATH}
+
+hydra:
+  run:
+    dir: ${experiment.exp_dir}/hydra

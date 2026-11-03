@@ -1402,8 +1402,12 @@ def validate_args(args, defaults={}):
             'residual connection in fp32 only supported when using fp16 or bf16.'
 
     if args.moe_grouped_gemm:
-        dc = cur_platform.get_device_capability()  # FlagScale Modify
-        assert dc[0] >= 8, "Unsupported compute capability for GroupedGEMM kernels."
+        # FlagScale Modify: compute-capability >= 8 is an NVIDIA/CUDA requirement.
+        # Non-CUDA backends (e.g. MUSA) use their own capability numbering, so the
+        # check does not apply to them.
+        if cur_platform.device_name() == "cuda":
+            dc = cur_platform.get_device_capability()
+            assert dc[0] >= 8, "Unsupported compute capability for GroupedGEMM kernels."
 
     if args.no_weight_decay_cond_type is not None:
         print_rank_0(
@@ -2773,6 +2777,10 @@ def _add_checkpointing_args(parser):
                        help='Do not save current optimizer.')
     group.add_argument('--no-save-rng', action='store_true', default=None,
                        help='Do not save current rng state.')
+    # FlagScale Modify: lets short perf tests exit without the end-of-training save.
+    group.add_argument('--no-save-at-end', action='store_true', default=False,
+                       help='Do not save a checkpoint when training finishes. '
+                       'Interval saves (--save-interval) still happen.')
     group.add_argument('--no-load-optim', action='store_true', default=None,
                        help='Do not load optimizer when loading checkpoint.')
     group.add_argument('--no-load-rng', action='store_true', default=None,

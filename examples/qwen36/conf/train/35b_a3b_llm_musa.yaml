@@ -1,0 +1,152 @@
+# Qwen3.6-35B-A3B (MoE, GDN + gated attention) LLM backbone on MUSA (MTT S5000),
+# 4 nodes x 8 GPUs. Adapted from 35b_a3b_llm_flash.yaml; differences:
+#   * MUSA backend: vendor TE, flagcx, unfused attention (head_dim 256 goes through
+#     the SDPA patch), no rope / MoE permute fusion (CUDA-only kernels).
+#   * overlap_grad_reduce / overlap_param_gather off: the MUSA TE backend does not
+#     emit zero grads for experts that got no tokens (see glm5 musa.yaml).
+#   * rotary_base 1e7 to match the HF config (rope_theta 10000000); the flash yaml
+#     has 1e6.
+#   * seq_length 8192 (flash yaml: 32768) and a short fixed iteration count for
+#     bring-up. Raise both once the run is stable.
+# TP4 EP2 -> DP8 (expert DP4). num_query_groups (2) < TP (4) is handled by
+# Megatron replicating KV heads. Checkpoint: tools/checkpoint/qwen35 hf2meg with
+# this yaml.
+system:
+  num_workers: 2
+  calculate_per_token_loss: true
+  tensor_model_parallel_size: 4
+  pipeline_model_parallel_size: 1
+  context_parallel_size: 1
+  expert_model_parallel_size: 2
+  use_distributed_optimizer: true
+  sequence_parallel: true
+  tp_comm_overlap: false
+  overlap_grad_reduce: false
+  overlap_param_gather: false
+  transformer_impl: transformer_engine
+  precision:
+    bf16: true
+    attention_softmax_in_fp32: true
+    accumulate_allreduce_grads_in_fp32: true
+  logging:
+    log_interval: 1
+    log_throughput: true
+    log_params_norm: true
+    log_num_zeros_in_grad: true
+    timing_log_level: 2
+    timing_log_option: minmax
+    logging_level: 20
+  checkpoint:
+    save_interval: 10000
+    ckpt_format: torch
+    load: ${oc.env:QWEN36_LOAD}
+    save: ${experiment.exp_dir}/checkpoints
+    no_save_at_end: true
+
+model:
+  finetune: true
+  te_fl_prefer: vendor
+  enable_flag_gems: false
+  distributed_backend: flagcx
+  attention_backend: unfused
+  # Qwen3.6-35B-A3B architecture
+  kv_channels: 256
+  qk_layernorm: true
+  disable_bias_linear: true
+  num_layers: 40
+  hidden_size: 2048
+  num_attention_heads: 16
+  num_query_groups: 2
+  seq_length: 8192
+  max_padding_length: 8192
+  max_position_embeddings: 262144
+  swiglu: true
+  normalization: RMSNorm
+  norm_epsilon: 1e-6
+  init_method_std: 6e-3
+  attention_dropout: 0.0
+  hidden_dropout: 0.0
+  clip_grad: 1.0
+  group_query_attention: true
+  no_masked_softmax_fusion: true
+  untie_embeddings_and_output_weights: true
+
+  position_embedding_type: mrope
+  rotary_percent: 0.25
+  rotary_base: 10000000
+  rotary_seq_len_interpolation_factor: 1
+  # mRoPE fusion kernel is CUDA-only.
+  no_rope_fusion: true
+  mrope_section: [11, 11, 10]
+  eod_mask_loss: false
+
+  recompute:
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+
+  no_check_for_nan_in_loss_and_grad: true
+  seed: 233
+
+  # Gated DeltaNet
+  experimental_attention_variant: gated_delta_net
+  linear_attention_freq: 4
+  linear_conv_kernel_dim: 4
+  linear_key_head_dim: 128
+  linear_value_head_dim: 128
+  linear_num_key_heads: 16
+  linear_num_value_heads: 32
+  layernorm_zero_centered_gamma: true
+  attention_output_gate: true
+
+  # MoE
+  num_experts: 256
+  moe_router_topk: 8
+  moe_ffn_hidden_size: 512
+  moe_shared_expert_gate: true
+  moe_shared_expert_intermediate_size: 512
+  moe_router_dtype: fp32
+  moe_router_load_balancing_type: global_aux_loss
+  moe_router_pre_softmax: false
+  moe_grouped_gemm: true
+  moe_token_dispatcher_type: alltoall
+  moe_permute_fusion: false
+  moe_aux_loss_coeff: 1.0e-3
+
+  micro_batch_size: 1
+  global_batch_size: 256
+  eval_iters: 0
+  eval_interval: 1000
+  train_iters: 10
+
+  optimizer:
+    optimizer: adam
+    loss_scale: 1.0
+    weight_decay: 0.1
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    lr_scheduler:
+      lr: 1.0e-5
+      min_lr: 1.0e-5
+      lr_warmup_iters: 0
+      lr_decay_style: constant
+
+  no_enable_vision: true
+
+  chunked_cross_entropy: true
+  cross_entropy_chunk_size: 2048
+
+data:
+  reset_position_ids: true
+  reset_attention_mask: true
+  no_create_attention_mask_in_dataloader: true
+  data_path: ${oc.env:QWEN36_DATA_PATH}
+  split: 1
+  no_mmap_bin_files: true
+  tokenizer:
+    tokenizer_type: HFTokenizerFS
+    tokenizer_path: ${oc.env:QWEN36_HF_PATH}
+    vocab_size: 248320
+    padded_vocab_size: 248320
+    make_vocab_size_divisible_by: 64

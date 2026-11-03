@@ -1,0 +1,85 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Qwen3.5-4B single-node smoke run on MUSA (Moore Threads), 1 node x 8 GPUs.
+# TP=2, PP=1 -> DP=4. Same MUSA settings as train_27b_musa.yaml; GDN runs via the
+# native-torch fallback in flagscale/train/megatron/patches/musa_gdn.py.
+# Env vars: QWEN35_HF_PATH QWEN35_LOAD QWEN35_DATA_PATH QWEN35_VISION_ROOT
+#           QWEN35_OUTPUT_DIR QWEN35_TRAIN_ITERS
+defaults:
+  - train: 4b
+  - _self_
+
+experiment:
+  exp_name: qwen35_4b_musa
+  exp_dir: ${oc.env:QWEN35_OUTPUT_DIR,./outputs/qwen35_4b_musa}
+  task:
+    type: train
+    backend: megatron
+    entrypoint: ./flagscale/train/megatron/train_qwen35.py
+  runner:
+    nnodes: 1
+    nproc_per_node: 8
+    per_node_task: false
+    no_shared_fs: false
+    rdzv_backend: static
+  envs:
+    CUDA_VISIBLE_DEVICES: 0,1,2,3,4,5,6,7
+    CUDA_DEVICE_MAX_CONNECTIONS: 1
+    MCCL_TOPO_ENHANCE: "0"
+    HYDRA_FULL_ERROR: "1"
+    OMP_NUM_THREADS: 4
+
+action: run
+
+train:
+  system:
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    use_flash_attn: false
+    tp_comm_overlap: false
+    overlap_grad_reduce: false
+    overlap_param_gather: false
+    precision:
+      bf16: true
+      attention_softmax_in_fp32: true
+      accumulate_allreduce_grads_in_fp32: true
+    logging:
+      log_interval: 1
+      log_throughput: true
+    checkpoint:
+      load: ${oc.env:QWEN35_LOAD}
+      save: ${experiment.exp_dir}/checkpoints
+      save_interval: 10000
+  model:
+    te_fl_prefer: vendor
+    enable_flag_gems: false
+    distributed_backend: flagcx
+    attention_backend: unfused
+    no_rope_fusion: true
+    seq_length: 1024
+    max_padding_length: 1024
+    train_iters: ${oc.env:QWEN35_TRAIN_ITERS,10}
+    micro_batch_size: 1
+    global_batch_size: 8
+    eval_iters: 0
+  data:
+    data_path: ${oc.env:QWEN35_DATA_PATH}
+    vision_root: ${oc.env:QWEN35_VISION_ROOT}
+    tokenizer:
+      tokenizer_path: ${oc.env:QWEN35_HF_PATH}
+
+hydra:
+  run:
+    dir: ${experiment.exp_dir}/hydra

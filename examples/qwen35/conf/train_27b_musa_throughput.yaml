@@ -1,0 +1,134 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Qwen3.5-27B image-text training on MUSA (MTT S5000), 4 nodes x 8 GPUs:
+# highest-throughput configuration measured so far.
+#
+# TP4 PP1 DP8, micro batch 2, global batch 256, fixed 8192-token padding,
+# frozen ViT, full uniform recompute. Measured 2026-11-02, steps 3-8:
+# 98.1 TFLOP/s/GPU, 113.4 s/step (torch GDN fallback baseline: 75.8, 146.8 s).
+# Compared on the same cluster: TP2 PP2 mbs1 (34/30 split) 94.8; TP2 PP2 mbs2
+# OOMs; tp_comm_overlap asserts/deadlocks on the MUSA TE userbuffers path.
+#
+# Differences from train_27b_musa.yaml:
+#   * GDN ops use fla's triton kernels (FLAGSCALE_MUSA_GDN_IMPL=fla). Needs
+#     fla + fla-core 0.6.0 importable; this cluster has them in /workspace/fla_pkg
+#     (pip install --no-deps --target ...), set QWEN35_FLA_PATH if elsewhere.
+#   * SwiGLU uses a fused triton kernel (FLAGSCALE_MUSA_TRITON_SWIGLU=1).
+#   * expandable_segments allocator: without it iteration 2 OOMs on the 3.79 GiB
+#     fp32 logits from fragmentation. Peak memory is still ~81/82 GB per GPU.
+#   * sshd listens on 2222 in the current containers.
+#
+# The triton cache (~/.triton) is per node. The first step compiles/autotunes
+# fla kernels (~3 min extra). Before a new TP / micro-batch config, run
+# examples/qwen35/warmup_fla_musa.py <tp> <mbs> once per node. If a node hangs in
+# autotune, copy a warmed cache instead: one from node 174 (TP4/TP2, mbs 1/2) is
+# kept at /workspace/outputs/qwen35_27b/triton_cache_174.
+#
+# Set before launching (same as train_27b_musa.yaml):
+#   QWEN35_HF_PATH QWEN35_LOAD QWEN35_DATA_PATH QWEN35_VISION_ROOT
+#   QWEN35_OUTPUT_DIR QWEN35_HOSTFILE
+# Every node also needs (pinned, --no-deps):
+#   megatron-energon==6.0.1 webdataset==1.0.2 multi-storage-client==0.30.0
+# and their small deps: braceexpand dataslots jmespath prettytable wcmatch xattr
+#
+# python run.py --config-path ./examples/qwen35/conf \
+#   --config-name train_27b_musa_throughput action=run
+defaults:
+  - train: 27b
+  - _self_
+
+experiment:
+  exp_name: qwen35_27b_musa_throughput
+  exp_dir: ${oc.env:QWEN35_OUTPUT_DIR,./outputs/qwen35_27b_musa_throughput}
+  task:
+    type: train
+    backend: megatron
+    entrypoint: ./flagscale/train/megatron/train_qwen35.py
+  runner:
+    nnodes: 4
+    nproc_per_node: 8
+    hostfile: ${oc.env:QWEN35_HOSTFILE,./examples/qwen35/conf/hostfile.txt}
+    per_node_task: false
+    no_shared_fs: false
+    rdzv_backend: static
+    # Container sshd port; the runner passes -p explicitly.
+    ssh_port: 2222
+  envs:
+    CUDA_VISIBLE_DEVICES: 0,1,2,3,4,5,6,7
+    CUDA_DEVICE_MAX_CONNECTIONS: 1
+    MCCL_TOPO_ENHANCE: "0"
+    HYDRA_FULL_ERROR: "1"
+    OMP_NUM_THREADS: 4
+    FLAGSCALE_MUSA_GDN_IMPL: fla
+    FLAGSCALE_MUSA_TRITON_SWIGLU: "1"
+    PYTORCH_MUSA_ALLOC_CONF: expandable_segments:True
+    # Inline env overrides the run script's PYTHONPATH export, so keep the
+    # FlagScale paths here as well.
+    PYTHONPATH: ${oc.env:QWEN35_FLA_PATH,/workspace/fla_pkg}:/workspace/FlagScale:/workspace/FlagScale/flagscale/train
+
+action: run
+
+train:
+  system:
+    use_flash_attn: false
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 1
+    num_workers: 4
+    # Perf-only overlaps off on MUSA TE backend. tp_comm_overlap is broken on
+    # MUSA TE (multicast assert; UB_SKIPMC=1 deadlocks, AG results wrong).
+    tp_comm_overlap: false
+    overlap_grad_reduce: false
+    overlap_param_gather: false
+    precision:
+      bf16: true
+      attention_softmax_in_fp32: true
+      accumulate_allreduce_grads_in_fp32: true
+    logging:
+      log_interval: 1
+      log_throughput: true
+      timing_log_level: 2
+      timing_log_option: minmax
+      logging_level: 20
+    checkpoint:
+      load: ${oc.env:QWEN35_LOAD}
+      save: ${experiment.exp_dir}/checkpoints
+      # Throughput run: skip writing the 27B checkpoint at the end.
+      no_save_at_end: true
+  model:
+    te_fl_prefer: vendor
+    enable_flag_gems: false
+    distributed_backend: flagcx
+    attention_backend: unfused
+    no_rope_fusion: true
+    seq_length: 8192
+    max_padding_length: 8192
+    enable_variable_seq_lengths: false
+    micro_batch_size: 2
+    global_batch_size: 256
+    # Throughput measurement length; steps 1-2 include triton compile/warmup.
+    train_iters: 8
+    freeze_ViT: true
+    cross_entropy_loss_fusion: true
+    cross_entropy_fusion_impl: native
+    # Full uniform recompute (from train/27b) is required: ~81/82 GB peak.
+  data:
+    data_path: ${oc.env:QWEN35_DATA_PATH}
+    vision_root: ${oc.env:QWEN35_VISION_ROOT}
+    tokenizer:
+      tokenizer_path: ${oc.env:QWEN35_HF_PATH}
+
+hydra:
+  run:
+    dir: ${experiment.exp_dir}/hydra
