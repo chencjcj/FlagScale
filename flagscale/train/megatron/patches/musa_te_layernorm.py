@@ -64,11 +64,13 @@ def _native_layernorm_fwd(
     Returns ``(y, means, rstdevs)`` where ``means``/``rstdevs`` are the per-row
     statistics saved for the backward pass (fp32, shape ``[N]``).
     """
-    if quantizer is not None:
-        raise NotImplementedError(
-            "MUSA native LayerNorm patch does not support FP8 output "
-            "(quantizer must be None)."
-        )
+    # FP8: MT-TE LayerNormLinear/LayerNormMLP pass a high-precision ``ln_out``
+    # buffer and cast to FP8 themselves when the returned tensor is not a
+    # QuantizedTensor, so return the bf16 result and leave quantization to TE.
+    # A pre-allocated quantized ``ln_out`` (userbuffers path) is quantized here.
+    quantized_out = None
+    if quantizer is not None and ln_out is not None and type(ln_out) is not torch.Tensor:
+        quantized_out, ln_out = ln_out, None
 
     inp_dtype = x.dtype
     x_fp32 = x.float()
@@ -87,7 +89,9 @@ def _native_layernorm_fwd(
     y = x_hat * w.unsqueeze(0) + bias.float().unsqueeze(0)
 
     y = y.to(inp_dtype)
-    if ln_out is not None:
+    if quantized_out is not None:
+        y = quantizer.quantize(y, out=quantized_out)
+    elif ln_out is not None:
         ln_out.copy_(y)
         y = ln_out
 

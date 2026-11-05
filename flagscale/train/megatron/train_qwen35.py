@@ -119,6 +119,22 @@ if getattr(cur_platform, "_name", None) == "musa":
         from patches.musa_swiglu import apply_musa_triton_swiglu_patch
 
         apply_musa_triton_swiglu_patch()
+    # Opt-in memory savings for tp_comm_overlap: build only the userbuffer
+    # communicators in FLAGSCALE_UB_SKIP's complement, and run the native
+    # fused CE in row chunks (FLAGSCALE_CHUNKED_CE=1, bit-identical results).
+    from patches.chunked_cross_entropy import apply_chunked_cross_entropy_patch
+    from patches.musa_ub import apply_musa_ub_saved_ln_out_fix, apply_musa_ub_skip_patch
+
+    apply_musa_ub_skip_patch()
+    # Required for correctness with tp_comm_overlap (no-op without userbuffers).
+    apply_musa_ub_saved_ln_out_fix()
+    apply_chunked_cross_entropy_patch()
+
+# Opt-in (FLAGSCALE_FP8_DEDUP_RECOMPUTE_AMAX=1): one fwd + one bwd FP8 amax
+# reduction per microbatch instead of one per te_checkpoint recompute region.
+from patches.fp8_recompute_amax import apply_fp8_recompute_amax_dedup_patch
+
+apply_fp8_recompute_amax_dedup_patch()
 ######### FlagScale End #########
 
 from tools.datasets.qwenvl.data.dataset_helpers import TaskEncoder, print_error_handler
@@ -158,6 +174,11 @@ def model_provider(
     # Qwen3.5 uses zero-centered gamma for RMSNorm; override if needed
     # (core_transformer_config_from_args may be affected by apply_layernorm_1p)
     config.layernorm_zero_centered_gamma = getattr(args, 'layernorm_zero_centered_gamma', True)
+    # This Megatron excludes tp_only_amax_red from the CLI; opt in via env to
+    # reduce FP8 amaxes over TP only (intra-node) instead of TP x DP.
+    if os.environ.get("FLAGSCALE_FP8_TP_ONLY_AMAX_RED", "0") == "1":
+        config.tp_only_amax_red = True
+        print_rank_0("FP8: amax reduction restricted to the tensor-parallel group.")
     use_te = args.transformer_impl == "transformer_engine"
     if not use_te:
         raise NotImplementedError("Qwen3.5 model is only implemented with TransformerEngine!")

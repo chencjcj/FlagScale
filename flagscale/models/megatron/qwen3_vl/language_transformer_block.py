@@ -5,6 +5,8 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import List, Optional, Union
 
+import os
+
 import torch
 from torch import Tensor, nn
 
@@ -186,7 +188,33 @@ class LanguageTransformerBlock(TransformerBlock):
             # Transformer layers and skip the rest.
             # A method fully use the device memory removing redundant re-computation.
             recompute_skip_num_layers = 0
+            # FlagScale: optionally keep core attention checkpointed on the layers that
+            # skip full recompute, so unfused attention does not keep its [b, h, s, s]
+            # scores/probs alive (opt-in via FLAGSCALE_BLOCK_RECOMPUTE_CORE_ATTN=1).
+            ckpt_core_attn = os.environ.get("FLAGSCALE_BLOCK_RECOMPUTE_CORE_ATTN", "0") == "1"
+            # FlagScale: per-pipeline-stage recompute layer counts. Earlier 1F1B stages
+            # hold more microbatches in flight, so a single recompute_num_layers either
+            # wastes memory on late stages or OOMs early ones. Comma-separated list
+            # indexed by pipeline rank, e.g. FLAGSCALE_RECOMPUTE_LAYERS_PER_STAGE=7,4,0,0.
+            recompute_num_layers = self.config.recompute_num_layers
+            per_stage = os.environ.get("FLAGSCALE_RECOMPUTE_LAYERS_PER_STAGE")
+            if per_stage:
+                counts = [int(c) for c in per_stage.split(",")]
+                pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+                assert pp_rank < len(counts), (
+                    f"FLAGSCALE_RECOMPUTE_LAYERS_PER_STAGE={per_stage!r} has no entry for "
+                    f"pipeline rank {pp_rank}"
+                )
+                recompute_num_layers = counts[pp_rank]
             for layer_idx in range(self.num_layers_per_pipeline_rank):
+                if ckpt_core_attn:
+                    attn = getattr(self.layers[layer_idx], "self_attention", None)
+                    if attn is not None and hasattr(attn, "checkpoint_core_attention"):
+                        attn.checkpoint_core_attention = not (
+                            recompute_skip_num_layers
+                            <= layer_idx
+                            < recompute_num_layers + recompute_skip_num_layers
+                        )
                 # Skip recomputation when input grad computation is not needed.
                 # Need to have at least one input tensor with gradient computation
                 # for re-enterant autograd engine.
@@ -195,7 +223,7 @@ class LanguageTransformerBlock(TransformerBlock):
                     recompute_skip_num_layers += 1
                 if (
                     layer_idx >= recompute_skip_num_layers
-                    and layer_idx < self.config.recompute_num_layers + recompute_skip_num_layers
+                    and layer_idx < recompute_num_layers + recompute_skip_num_layers
                 ):
                     hidden_states, context = checkpoint_handler(custom(layer_idx, layer_idx + 1))
                 else:

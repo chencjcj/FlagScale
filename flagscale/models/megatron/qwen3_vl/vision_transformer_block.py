@@ -344,7 +344,15 @@ class VisionTransformerBlock(TransformerBlock):
 
         with rng_context, outer_quantization_context:
             # Forward pass.
-            if self.config.recompute_granularity == 'full' and self.training:
+            # A frozen ViT (no trainable params, input without grad) never runs
+            # backward, so checkpointing it only adds work. Under FP8 it also
+            # leaks: TE stashes amax/scale per checkpointed module in forward and
+            # pops them only in the backward recompute, which never happens.
+            needs_grad = torch.is_grad_enabled() and (
+                hidden_states.requires_grad
+                or any(p.requires_grad for p in self.parameters())
+            )
+            if self.config.recompute_granularity == 'full' and self.training and needs_grad:
                 assert self.config.recompute_method == 'uniform' and self.config.recompute_num_layers == 1, \
                     f"Only uniform recompute with recompute_num_layers=1 is supported for full recompute in Qwen3-VL."
                 hidden_states = self._checkpointed_forward(
